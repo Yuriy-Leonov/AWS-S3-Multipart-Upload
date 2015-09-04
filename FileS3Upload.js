@@ -1,4 +1,8 @@
 (function() {
+    /**
+    @param {Object} [config]
+    @constructor
+    */
     var FileS3Upload = function(config){
         //  config should be object and contain following:
         //
@@ -15,7 +19,7 @@
         //      URL on your server where is possible get signature for request
         //
         //      e.x.backend function on python(django):
-        //      def auth_sign(request:
+        //      def auth_sign(request):
         //          to_sign = request.GET.get('to_sign')  # 'POST\n\n\n\nx-amz-date:Tue, 01 Sep 2015 13:47:40 GMT\n/mybucket/name_file.txt?uploads'
         //          signature = base64.b64encode(hmac.new(AWS_S3_SECRET_ACCESS_KEY, to_sign, hashlib.sha1).digest())
         //          return HttpResponse(signature)
@@ -28,6 +32,65 @@
         //      This headers will be added in GET request on "auth_url"
         //      It's required if your backend requires any mandatory header
         //
+        //  Optional:
+        //
+        //  - partSize: integer
+        //      Size for one part(blob) in byte
+        //
+        //  [successful callbacks]
+        //  - on_get_upload_id: function(xhr, uploadId){}
+        //      Fires when uploadId is got
+        //      Takes xhr and uploadId which was provided by s3
+        //
+        //  - on_part_upload: function(xhr, ETag, part_number){}
+        //      Fires when part is uploaded on s3
+        //      Takes:
+        //        xhr
+        //        ETag -  which was provided by s3 in header "ETag"
+        //        part_number - sequence number of part
+        //
+        //  - on_multipart_upload_complete: function(xhr)
+        //      Fires when multipart upload is complete
+        //
+        //  [common errors]
+        //  - not_supported_error: function(){}
+        //      It will be called if FileS3Upload is unsupported for current browser
+        //      Doesn't take any arguments
+        //
+        //  - on_network_error: function(xhr){}
+        //      Fires when there is a failure on the network level
+        //      Placed in xhr.onerror
+        //
+        //  - on_non_200_error: function(xhr){}
+        //      It will be called if response doesn't have 200 status
+        //      If specific error isn't specified
+        //
+        //  [specific errors]
+        //  If this type error is specified then common error won't be called in certain place
+        //  - on_auth_error: function(xhr){}
+        //      It will be called if response on "auth_url" doesn't have 200 status
+        //      Takes one argument "xhr"
+        //
+        //  - on_getting_upload_id_error: function(xhr){}
+        //      It will be called if response on "aws_url" doesn't have 200 status
+        //      On step when uploadId should be taken
+        //      Takes one argument "xhr"
+        //
+        //  - on_absence_upload_id_error: function(xhr){}
+        //      It will be called if response on "aws_url" has 200 status
+        //      But doesn't contain <UploadId\>...<\/UploadId\> in body response
+        //      Takes one argument "xhr"
+        //
+        //  - on_send_part_error: function(xhr){}
+        //      It will be called if response on "aws_url" doesn't have 200 status
+        //      On step when part(blob) is sent to aws
+        //      Takes one argument "xhr"
+        //
+        //  - on_complete_multipart_error: function(xhr){}
+        //      It will be called if response on "aws_url" doesn't have 200 status
+        //      On step when request contains data for completing multipart upload
+        //      Takes one argument "xhr"
+        //
 
 
         this.supported = !((typeof(File)=='undefined') || (typeof(Blob)=='undefined') ||
@@ -39,11 +102,6 @@
 
 
         var self = this,
-            files = [],
-            con = extend({
-                maxConcurrentParts: 1,
-                partSize: 6 * 1024 * 1024  // 6 Mb
-            }, config || {}),
             required_keys = [
                 'aws_url',
                 'file_name',
@@ -57,7 +115,11 @@
             all_keys = [],
             key,
             ind;
-        self.config = con;
+        self.config = extend(
+            {partSize: 6 * 1024 * 1024},  // 6 Mb
+            config || {}
+        );
+
 
         // "Check mandatory keys in config"
         for (key in self.config){
@@ -71,6 +133,7 @@
             }
         }
         if(missed_keys.length > 0){
+            self.config.not_supported_error && self.config.not_supported_error();
             throw 'Missed keys in config: ' + missed_keys.join(', ');
         }
         // END "Check mandatory keys in config"
@@ -78,15 +141,17 @@
         self.config.file_name = encodeURIComponent(self.config.file_name);
         self.config.file.name = encodeURIComponent(self.config.file.name);
         self.count_of_parts = Math.ceil(self.config.file.size / self.config.partSize) || 1;
+        self.file_size = self.config.file.size;
         self.current_part = 1;
         self.parts = [];
 
+        log('Total count of parts = ' + self.count_of_parts);
+
         self._sign_request = function(method, suffix_to_sign, contentType, success_callback){
-            var xhr = getXmlHttp(),
+            var xhr = self.getXmlHttp(),
                 to_sign,
                 signature,
                 date_gmt = new Date().toUTCString();
-//            contentType: 'application/xml; charset=UTF-8'
             to_sign = method + '\n\n' + contentType +
                 '\n\nx-amz-date:' + date_gmt + '\n/' +
                 self.config.bucket + '/' +
@@ -103,11 +168,11 @@
                         signature = xhr.response;
                         success_callback && success_callback(signature, date_gmt);
                     } else {
-                        debugger;
+                        self.config.on_non_200_error && self.config.on_non_200_error(xhr) ||
+                        self.config.on_auth_error && self.config.on_auth_error(xhr);
                     }
                 }
             };
-            xhr.onerror = function(){debugger;};
             xhr.send(null);
         };
 
@@ -140,23 +205,25 @@
         };
 
         self._send_blob = function(signature, date_gmt, suffix, blob){
-            var xhr = getXmlHttp(),
-                eTag;
+            var xhr = self.getXmlHttp(),
+                ETag;
             xhr.open('PUT', joinUrlElements(self.config.aws_url, '/' + self.config.file_name + suffix));
             xhr.setRequestHeader('Authorization', 'AWS ' + self.config.aws_key_id + ':' + signature);
             xhr.setRequestHeader('x-amz-date', date_gmt);
             xhr.onreadystatechange = function(){
                 if (xhr.readyState == 4){
                     if (xhr.status == 200){
-                        eTag = xhr.getResponseHeader('ETag');
-                        log('ETag = ' + eTag + ' For part #' + self.current_part);
-                        self.parts.push(eTag);
+                        ETag = xhr.getResponseHeader('ETag');
+                        log('ETag = ' + ETag + ' For part #' + self.current_part);
+                        self.parts.push(ETag);
+                        self.config.on_part_upload && self.config.on_part_upload(xhr, ETag, self.current_part);
                         self.current_part += 1;
                         setTimeout(function(){  // to avoid recursion
                             self._send_part();
                         }, 50);
                     } else {
-                        debugger;  // error
+                        self.config.on_non_200_error && self.config.on_non_200_error(xhr) ||
+                        self.config.on_send_part_error && self.config.on_send_part_error(xhr);
                     }
                 }
             };
@@ -164,26 +231,29 @@
         };
 
         self._get_upload_id = function(signature, date_gmt){
-            var xhr = getXmlHttp(),
-                match;
+            var xhr = self.getXmlHttp(),
+                uploadId;
             xhr.open('POST', joinUrlElements(self.config.aws_url, '/' + self.config.file_name + '?uploads'));
             xhr.setRequestHeader('Authorization', 'AWS ' + self.config.aws_key_id + ':' + signature);
             xhr.setRequestHeader('x-amz-date', date_gmt);
             xhr.onreadystatechange = function(){
                 if (xhr.readyState == 4){
                     if (xhr.status == 200){
-                        match = xhr.response.match(/<UploadId\>(.+)<\/UploadId\>/);
-                        if (match && match[1]){
-                            self.UploadId = match[1];
-                            log('Got match: ' + self.UploadId);
+                        uploadId = xhr.response.match(/<UploadId\>(.+)<\/UploadId\>/);
+                        if (uploadId && uploadId[1]){
+                            self.UploadId = uploadId[1];
+                            log('Got UploadId: ' + self.UploadId);
+                            self.config.on_get_upload_id && self.config.on_get_upload_id(xhr, self.UploadId);
                             setTimeout(function(){
                                 self._send_part();
                             }, 50);
                         }else{
-                            debugger;  // error
+                            self.config.on_non_200_error && self.config.on_non_200_error(xhr) ||
+                            self.config.on_absence_upload_id_error && self.config.on_absence_upload_id_error(xhr);
                         }
                     } else {
-                        debugger;  // error
+                        self.config.on_non_200_error && self.config.on_non_200_error(xhr) ||
+                        self.config.on_getting_upload_id_error && self.config.on_getting_upload_id_error(xhr);
                     }
                 }
             };
@@ -191,7 +261,7 @@
         };
 
         self.complete_multipart_upload = function(signature, date_gmt, suffix){
-            var xhr = getXmlHttp(),
+            var xhr = self.getXmlHttp(),
                 completeDoc = '<CompleteMultipartUpload>';
             xhr.open('POST', joinUrlElements(self.config.aws_url, '/' + self.config.file_name + suffix));
             xhr.setRequestHeader('Authorization', 'AWS ' + self.config.aws_key_id + ':' + signature);
@@ -201,38 +271,41 @@
                 if (xhr.readyState == 4){
                     if (xhr.status == 200){
                         log('END');
+                        self.config.on_multipart_upload_complete && self.config.on_multipart_upload_complete(xhr);
                     } else {
-                        debugger;  // error
+                        self.config.on_non_200_error && self.config.on_non_200_error(xhr) ||
+                        self.config.on_complete_multipart_error && self.config.on_complete_multipart_error(xhr);
                     }
                 }
             };
 
-            self.parts.forEach(function(eTag, partNumber){
-                completeDoc += '<Part><PartNumber>' + (partNumber + 1) + '</PartNumber><ETag>' + eTag + '</ETag></Part>';
+            self.parts.forEach(function(ETag, partNumber){
+                completeDoc += '<Part><PartNumber>' + (partNumber + 1) + '</PartNumber><ETag>' + ETag + '</ETag></Part>';
             });
             completeDoc += '</CompleteMultipartUpload>';
-
             xhr.send(completeDoc);
-        }
-    };
+        };
 
-    function getXmlHttp(){
-        var xmlhttp;
-        try {
-            xmlhttp = new ActiveXObject("Msxml2.XMLHTTP");
-        } catch (e) {
+        self.getXmlHttp = function(){
+            var xmlhttp;
             try {
-                xmlhttp = new ActiveXObject("Microsoft.XMLHTTP");
-            } catch (E) {
-                xmlhttp = false;
+                xmlhttp = new ActiveXObject("Msxml2.XMLHTTP");
+            } catch (e) {
+                try {
+                    xmlhttp = new ActiveXObject("Microsoft.XMLHTTP");
+                } catch (E) {
+                    xmlhttp = false;
+                }
             }
-        }
-        if (!xmlhttp && typeof XMLHttpRequest!='undefined') {
-            xmlhttp = new XMLHttpRequest();
-        }
-        return xmlhttp;
-    }
-
+            if (!xmlhttp && typeof XMLHttpRequest!='undefined') {
+                xmlhttp = new XMLHttpRequest();
+            }
+            xmlhttp.onerror = function(){
+                self.config.on_network_error && self.config.on_network_error(xhr);
+            };
+            return xmlhttp;
+        };
+    };
     function extend(obj1, obj2, obj3){
 
         if (typeof obj1 == 'undefined'){obj1 = {};}
@@ -267,5 +340,4 @@
         window.FileS3Upload = FileS3Upload;
     }
 })();
-
 
