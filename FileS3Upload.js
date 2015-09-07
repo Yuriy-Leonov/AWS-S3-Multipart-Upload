@@ -52,6 +52,9 @@
         //  - on_multipart_upload_complete: function(xhr)
         //      Fires when multipart upload is complete
         //
+        //  - on_progress: function(total, loaded)
+        //      Fires when part is uploaded
+        //
         //  [common errors]
         //  - not_supported_error: function(){}
         //      It will be called if FileS3Upload is unsupported for current browser
@@ -141,7 +144,8 @@
         self.config.file_name = encodeURIComponent(self.config.file_name);
         self.config.file.name = encodeURIComponent(self.config.file.name);
         self.count_of_parts = Math.ceil(self.config.file.size / self.config.partSize) || 1;
-        self.file_size = self.config.file.size;
+        self.total = self.config.file.size;
+        self.loaded = 0;
         self.current_part = 1;
         self.parts = [];
 
@@ -210,12 +214,24 @@
             xhr.open('PUT', joinUrlElements(self.config.aws_url, '/' + self.config.file_name + suffix));
             xhr.setRequestHeader('Authorization', 'AWS ' + self.config.aws_key_id + ':' + signature);
             xhr.setRequestHeader('x-amz-date', date_gmt);
+
+            if(xhr.upload){
+                xhr.upload.addEventListener("progress", function(prog) {
+//                    value = ~~((prog.loaded / prog.total) * 100);
+                    self.config.on_progress && self.config.on_progress(self.total, self.loaded + prog.loaded);
+                }, false);
+            }
             xhr.onreadystatechange = function(){
                 if (xhr.readyState == 4){
                     if (xhr.status == 200){
                         ETag = xhr.getResponseHeader('ETag');
                         log('ETag = ' + ETag + ' For part #' + self.current_part);
                         self.parts.push(ETag);
+
+                        self.loaded += blob.size;
+                        self.config.on_progress && self.config.on_progress(self.total, self.loaded);
+                        // put it here becouse in future we should keep for unuploaded parts
+
                         self.config.on_part_upload && self.config.on_part_upload(xhr, ETag, self.current_part);
                         self.current_part += 1;
                         setTimeout(function(){  // to avoid recursion
