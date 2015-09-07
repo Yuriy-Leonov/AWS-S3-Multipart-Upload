@@ -68,6 +68,9 @@
         //      It will be called if response doesn't have 200 status
         //      If specific error isn't specified
         //
+        //  - on_abort: function(xhr){}
+        //      Fires when xhr is aborted
+        //
         //  [specific errors]
         //  If this type error is specified then common error won't be called in certain place
         //  - on_auth_error: function(xhr){}
@@ -151,6 +154,19 @@
 
         log('Total count of parts = ' + self.count_of_parts);
 
+        self.base_onreadystatechange = function(setup, xhr){
+                if (xhr.readyState == 4){
+                    if (xhr.status == 200){
+                        setup.f_200 && setup.f_200()
+                    } else if (xhr.readyState == 0) {
+                        self.config.on_abort && self.config.on_abort(xhr);
+                    } else {
+                        self.config.on_non_200_error && self.config.on_non_200_error(xhr) ||
+                        self.config[setup.name_non_200_error] && self.config[setup.name_non_200_error](xhr);
+                    }
+                }
+        };
+
         self._sign_request = function(method, suffix_to_sign, contentType, success_callback){
             var xhr = self.getXmlHttp(),
                 to_sign,
@@ -167,15 +183,13 @@
                 }
             }
             xhr.onreadystatechange = function(){
-                if (xhr.readyState == 4){
-                    if (xhr.status == 200){
+                self.base_onreadystatechange({
+                    f_200: function(){
                         signature = xhr.response;
                         success_callback && success_callback(signature, date_gmt);
-                    } else {
-                        self.config.on_non_200_error && self.config.on_non_200_error(xhr) ||
-                        self.config.on_auth_error && self.config.on_auth_error(xhr);
-                    }
-                }
+                    },
+                    name_non_200_error: 'on_auth_error'
+                }, xhr);
             };
             xhr.send(null);
         };
@@ -222,8 +236,8 @@
                 }, false);
             }
             xhr.onreadystatechange = function(){
-                if (xhr.readyState == 4){
-                    if (xhr.status == 200){
+                self.base_onreadystatechange({
+                    f_200: function(){
                         ETag = xhr.getResponseHeader('ETag');
                         log('ETag = ' + ETag + ' For part #' + self.current_part);
                         self.parts.push(ETag);
@@ -237,11 +251,9 @@
                         setTimeout(function(){  // to avoid recursion
                             self._send_part();
                         }, 50);
-                    } else {
-                        self.config.on_non_200_error && self.config.on_non_200_error(xhr) ||
-                        self.config.on_send_part_error && self.config.on_send_part_error(xhr);
-                    }
-                }
+                    },
+                    name_non_200_error: 'on_send_part_error'
+                }, xhr);
             };
             xhr.send(blob);
         };
@@ -253,8 +265,8 @@
             xhr.setRequestHeader('Authorization', 'AWS ' + self.config.aws_key_id + ':' + signature);
             xhr.setRequestHeader('x-amz-date', date_gmt);
             xhr.onreadystatechange = function(){
-                if (xhr.readyState == 4){
-                    if (xhr.status == 200){
+                self.base_onreadystatechange({
+                    f_200: function(){
                         uploadId = xhr.response.match(/<UploadId\>(.+)<\/UploadId\>/);
                         if (uploadId && uploadId[1]){
                             self.UploadId = uploadId[1];
@@ -267,11 +279,9 @@
                             self.config.on_non_200_error && self.config.on_non_200_error(xhr) ||
                             self.config.on_absence_upload_id_error && self.config.on_absence_upload_id_error(xhr);
                         }
-                    } else {
-                        self.config.on_non_200_error && self.config.on_non_200_error(xhr) ||
-                        self.config.on_getting_upload_id_error && self.config.on_getting_upload_id_error(xhr);
-                    }
-                }
+                    },
+                    name_non_200_error: 'on_getting_upload_id_error'
+                }, xhr);
             };
             xhr.send(null);
         };
@@ -284,15 +294,13 @@
             xhr.setRequestHeader('Content-Type', 'application/xml; charset=UTF-8');
             xhr.setRequestHeader('x-amz-date', date_gmt);
             xhr.onreadystatechange = function(){
-                if (xhr.readyState == 4){
-                    if (xhr.status == 200){
+                self.base_onreadystatechange({
+                    f_200: function(){
                         log('END');
                         self.config.on_multipart_upload_complete && self.config.on_multipart_upload_complete(xhr);
-                    } else {
-                        self.config.on_non_200_error && self.config.on_non_200_error(xhr) ||
-                        self.config.on_complete_multipart_error && self.config.on_complete_multipart_error(xhr);
-                    }
-                }
+                    },
+                    name_non_200_error: 'on_complete_multipart_error'
+                }, xhr);
             };
 
             self.parts.forEach(function(ETag, partNumber){
@@ -300,6 +308,10 @@
             });
             completeDoc += '</CompleteMultipartUpload>';
             xhr.send(completeDoc);
+        };
+
+        self.abort = function(){
+            self.xhr.abort();
         };
 
         self.getXmlHttp = function(){
@@ -319,6 +331,7 @@
             xmlhttp.onerror = function(){
                 self.config.on_network_error && self.config.on_network_error(xhr);
             };
+            self.xhr = xmlhttp;
             return xmlhttp;
         };
     };
